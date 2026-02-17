@@ -1,0 +1,9 @@
+opencv-python>=4.8.0
+moviepy>=1.0.3
+scenedetect[opencv]>=0.6.0
+openai-whisper>=20231117
+elevenlabs>=1.0.0
+fal-client>=0.4.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+Pillow>=10.0.0
