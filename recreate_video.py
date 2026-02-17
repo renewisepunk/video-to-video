@@ -27,6 +27,8 @@ import whisper
 from elevenlabs.client import ElevenLabs
 import fal_client
 
+from cost_tracker import CostTracker
+
 # ---------------------------------------------------------------------------
 # Load environment variables
 # ---------------------------------------------------------------------------
@@ -34,10 +36,85 @@ load_dotenv()
 
 FAL_API_KEY = os.getenv("FAL_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEFAULT_VOICE_ID = os.getenv("VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
 
 if FAL_API_KEY:
     os.environ["FAL_KEY"] = FAL_API_KEY
+
+
+# ---------------------------------------------------------------------------
+# Actor Image Generation (Google Gemini)
+# ---------------------------------------------------------------------------
+
+def _analyze_scene(keyframe_path):
+    """Use Gemini Vision to describe the scene from a keyframe (no text/captions)."""
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    image = Image.open(keyframe_path)
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            types.Part.from_image(image),
+            "Describe this video frame for recreating it with a different person. "
+            "Focus on: camera angle, framing (close-up/medium/wide), background "
+            "environment, lighting (natural/studio/warm/cool), clothing style, "
+            "body posture and hand gestures, overall mood. "
+            "Ignore any text, captions, or watermarks. "
+            "Be specific and concise (3-4 sentences).",
+        ],
+    )
+    return response.text
+
+
+def generate_actor_image(actor_description, keyframe_path, output_dir):
+    """Generate an actor image matching the original video's style.
+
+    1. Analyze a keyframe to extract scene context (background, lighting, framing)
+    2. Combine with user's actor description to generate a coherent new image
+    """
+    print("\n=== Generating Actor Image (Gemini) ===")
+
+    actor_path = os.path.join(output_dir, "generated_actor.png")
+    if os.path.exists(actor_path):
+        print(f"  Actor image already exists: {actor_path}")
+        return actor_path
+
+    from google import genai
+
+    # Step 1: Analyze the original scene
+    print("  Analyzing original video scene...")
+    scene_description = _analyze_scene(keyframe_path)
+    print(f"  Scene: {scene_description}")
+
+    # Step 2: Build a coherent prompt combining scene + new actor
+    prompt = (
+        f"Generate a realistic photograph of the following person: {actor_description}. "
+        f"Place them in this exact scene and style: {scene_description}. "
+        "The image should look like a real video frame, not AI-generated. "
+        "Portrait orientation. No text, no captions, no watermarks."
+    )
+    print(f"  Generating new actor image...")
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash-image",
+        contents=[prompt],
+    )
+
+    for part in response.parts:
+        if part.inline_data is not None:
+            image = part.as_image()
+            image.save(actor_path)
+            print(f"  -> Actor image saved: {actor_path}")
+            return actor_path
+
+    print("ERROR: Gemini did not return an image.")
+    sys.exit(1)
+
 
 # ---------------------------------------------------------------------------
 # Phase 1 – Video Analysis & Extraction
@@ -119,27 +196,66 @@ def transcribe_audio(audio_path, output_dir, whisper_model="base"):
 # Phase 3 – Audio Recreation (ElevenLabs TTS)
 # ---------------------------------------------------------------------------
 
-def recreate_audio(transcript, voice_id, output_dir):
+def recreate_audio(transcript, voice_id, output_dir, cost_tracker=None):
     """Generate a new audio track from the transcript using ElevenLabs."""
     print("\n=== Phase 3: Audio Recreation ===")
 
     new_audio_path = os.path.join(output_dir, "new_audio.mp3")
     if not os.path.exists(new_audio_path):
+        text = transcript["text"]
         print(f"Generating speech with voice_id={voice_id}...")
+        from elevenlabs import VoiceSettings
+
         client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
         audio_generator = client.text_to_speech.convert(
-            text=transcript["text"],
+            text=text,
             voice_id=voice_id,
-            model_id="eleven_multilingual_v2",
+            model_id="eleven_v3",
+            output_format="mp3_44100_128",
+            voice_settings=VoiceSettings(
+                stability=0.0,              # "Creative" - most expressive/natural
+                similarity_boost=0.78,
+                style=0.0,
+                use_speaker_boost=False,
+            ),
         )
         with open(new_audio_path, "wb") as f:
             for chunk in audio_generator:
                 f.write(chunk)
-        print(f"  -> New audio saved to {new_audio_path}")
+        print(f"  -> Raw TTS audio saved to {new_audio_path}")
+
+        if cost_tracker:
+            cost_tracker.record_elevenlabs(len(text), model_id="eleven_v3")
+
+        # Light post-processing for naturalness
+        _post_process_audio(new_audio_path)
     else:
         print("New audio already generated, skipping.")
 
     return new_audio_path
+
+
+def _post_process_audio(audio_path):
+    """Apply light post-processing: high-pass filter + loudness normalization."""
+    try:
+        from pydub import AudioSegment
+        from pydub.effects import normalize, high_pass_filter
+
+        print("  Applying audio post-processing...")
+        audio = AudioSegment.from_mp3(audio_path)
+
+        # Remove sub-80Hz rumble common in TTS output
+        audio = high_pass_filter(audio, cutoff=80)
+
+        # Normalize loudness (~-16 LUFS broadcast level)
+        audio = normalize(audio, headroom=1.0)
+
+        audio.export(audio_path, format="mp3", bitrate="128k")
+        print("  -> Post-processing applied (high-pass + normalization)")
+    except ImportError:
+        print("  pydub not installed; skipping post-processing.")
+    except Exception as e:
+        print(f"  WARNING: Post-processing failed ({e}); using raw TTS audio.")
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +277,7 @@ def _download_file(url, dest_path):
 
 # ---- Text removal from actor image -----------------------------------------
 
-def remove_text_from_image(image_path, output_dir):
+def remove_text_from_image(image_path, output_dir, cost_tracker=None):
     """Detect and remove text/captions from an image using OCR + inpainting.
 
     Pipeline:
@@ -181,6 +297,8 @@ def remove_text_from_image(image_path, output_dir):
         "fal-ai/florence-2-large/ocr",
         arguments={"image_url": image_url},
     )
+    if cost_tracker:
+        cost_tracker.record_fal("fal-ai/florence-2-large/ocr", unit_count=1)
 
     # Florence-2 OCR returns results under varying keys; handle both formats
     results = ocr_result.get("results") or ocr_result.get("output") or {}
@@ -227,6 +345,8 @@ def remove_text_from_image(image_path, output_dir):
             "mask_url": mask_url,
         },
     )
+    if cost_tracker:
+        cost_tracker.record_fal("fal-ai/flux-pro/v1/fill", unit_count=1)
 
     clean_url = inpaint_result["images"][0]["url"]
     _download_file(clean_url, clean_path)
@@ -238,7 +358,7 @@ def remove_text_from_image(image_path, output_dir):
 # ---- Mode A: OmniHuman v1.5 (image + audio -> full-body talking video) --
 
 def generate_omnihuman_video(actor_image, new_audio_path, output_dir,
-                             resolution="720p", turbo=False):
+                             resolution="720p", turbo=False, cost_tracker=None):
     """Generate a talking-head video using ByteDance OmniHuman v1.5.
 
     Takes a single image of the new actor and the audio track, produces a
@@ -303,6 +423,9 @@ def generate_omnihuman_video(actor_image, new_audio_path, output_dir,
     print("  Downloading generated video...")
     _download_file(video_url, clip_path)
 
+    if cost_tracker:
+        cost_tracker.record_fal_video("fal-ai/bytedance/omnihuman/v1.5", audio_dur)
+
     size_mb = os.path.getsize(clip_path) / (1024 * 1024)
     print(f"  -> Saved video: {clip_path} ({size_mb:.1f} MB)")
     return [clip_path]
@@ -310,7 +433,7 @@ def generate_omnihuman_video(actor_image, new_audio_path, output_dir,
 
 # ---- Mode A-legacy: SadTalker (free, lower quality) ---------------------
 
-def generate_sadtalker_video(actor_image, new_audio_path, output_dir):
+def generate_sadtalker_video(actor_image, new_audio_path, output_dir, cost_tracker=None):
     """Generate a talking-head video using SadTalker (free, face-only)."""
     print("\n=== Phase 4: Video Generation (SadTalker) ===")
 
@@ -357,6 +480,9 @@ def generate_sadtalker_video(actor_image, new_audio_path, output_dir):
     print("  Downloading generated video...")
     _download_file(video_url, clip_path)
 
+    if cost_tracker:
+        cost_tracker.record_fal("fal-ai/sadtalker", unit_count=1)
+
     size_mb = os.path.getsize(clip_path) / (1024 * 1024)
     print(f"  -> Saved video: {clip_path} ({size_mb:.1f} MB)")
     return [clip_path]
@@ -364,7 +490,7 @@ def generate_sadtalker_video(actor_image, new_audio_path, output_dir):
 
 # ---- Mode B: Scene-based generation (Luma Dream Machine) ----------------
 
-def generate_scene_videos(keyframe_dir, transcript, output_dir, prompt_template=None):
+def generate_scene_videos(keyframe_dir, transcript, output_dir, prompt_template=None, cost_tracker=None):
     """Generate a new video clip for each scene keyframe via Luma Dream Machine."""
     print("\n=== Phase 4: Scene Video Generation (Luma) ===")
 
@@ -435,6 +561,9 @@ def generate_scene_videos(keyframe_dir, transcript, output_dir, prompt_template=
         print(f"  Scene {scene_num}/{num_scenes}: downloading clip...")
         _download_file(video_url, clip_path)
 
+        if cost_tracker:
+            cost_tracker.record_fal("fal-ai/luma-dream-machine", unit_count=1)
+
         generated_paths.append(clip_path)
         print(f"  -> Saved {clip_path}")
 
@@ -501,28 +630,29 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # OmniHuman v1.5 (default) – create a talking-head video from an actor image
+  # Use an existing actor image
   python recreate_video.py Videos/Lujo_-_José.mp4 --actor-image actor.jpg
 
-  # OmniHuman at 1080p with turbo mode
-  python recreate_video.py Videos/Lujo_-_José.mp4 --actor-image actor.jpg --resolution 1080p --turbo
-
-  # SadTalker (free, lower quality)
-  python recreate_video.py Videos/Lujo_-_José.mp4 --mode sadtalker --actor-image actor.jpg
+  # Generate a new actor with AI (analyzes original video for scene matching)
+  python recreate_video.py Videos/Lujo_-_José.mp4 --generate-actor "A blonde woman in her 30s"
 
   # Scene-based generation (Luma Dream Machine, no actor needed)
   python recreate_video.py Videos/Lujo_-_José.mp4 --mode scenes
-
-  # Custom prompt for scene mode
-  python recreate_video.py Videos/Lujo_-_José.mp4 --mode scenes --prompt "A futuristic scene. {scene_text}"
         """,
     )
     parser.add_argument("video", help="Path to the source video file")
     parser.add_argument(
         "--actor-image",
         default=None,
-        help="Path to the actor/person image (required for omnihuman/sadtalker modes). "
-             "If not provided, falls back to the first extracted keyframe.",
+        help="Path to an existing actor image file.",
+    )
+    parser.add_argument(
+        "--generate-actor",
+        default=None,
+        metavar="DESCRIPTION",
+        help="Generate a new actor with AI. Describe the person's appearance "
+             "(e.g. 'A blonde woman in her 30s'). The scene, lighting, and "
+             "framing are automatically matched to the original video.",
     )
     parser.add_argument(
         "--voice-id",
@@ -600,6 +730,11 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     print(f"Output directory: {output_dir}")
 
+    # Cost tracking (saved to costs.json in project root and output_dir)
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    cost_tracker = CostTracker(project_root=project_root)
+    cost_tracker.set_run_meta(video_path, output_dir, args.mode)
+
     # Phase 1: Analyze
     audio_path, keyframe_dir = analyze_video(video_path, output_dir)
 
@@ -608,52 +743,70 @@ def main():
 
     # Phase 3: Recreate audio
     voice_id = args.voice_id or DEFAULT_VOICE_ID
-    new_audio_path = recreate_audio(transcript, voice_id, output_dir)
+    new_audio_path = recreate_audio(transcript, voice_id, output_dir, cost_tracker=cost_tracker)
 
     if args.skip_video_gen:
         print("\n--skip-video-gen set. Stopping before video generation.")
         print(f"Transcript: {os.path.join(output_dir, 'transcript.json')}")
         print(f"New audio:  {new_audio_path}")
+        run_path, global_path = cost_tracker.save_run(output_dir)
+        print(f"Costs saved: {run_path} | {global_path}")
         return
 
     # Phase 4: Generate videos
     if args.mode in ("omnihuman", "sadtalker"):
-        # Resolve actor image
-        actor_image = args.actor_image
-        if not actor_image:
-            # Fall back to first extracted keyframe
-            keyframes = sorted(glob.glob(os.path.join(keyframe_dir, "*.jpg")))
-            if keyframes:
-                actor_image = keyframes[0]
-                print(f"No --actor-image provided; using first keyframe: {actor_image}")
-            else:
-                print("ERROR: No --actor-image and no keyframes found.")
+        # Resolve actor image: --generate-actor > --actor-image > first keyframe
+        keyframes = sorted(glob.glob(os.path.join(keyframe_dir, "*.jpg")))
+        if args.generate_actor:
+            ref_keyframe = keyframes[0] if keyframes else None
+            if not ref_keyframe:
+                print("ERROR: No keyframes found to analyze scene for actor generation.")
                 sys.exit(1)
-        elif not os.path.exists(actor_image):
+            actor_image = generate_actor_image(
+                args.generate_actor, ref_keyframe, output_dir
+            )
+        elif args.actor_image:
+            actor_image = args.actor_image
+        elif keyframes:
+            actor_image = keyframes[0]
+            print(f"No --actor-image provided; using first keyframe: {actor_image}")
+        else:
+            print("ERROR: No --actor-image, --generate-actor, and no keyframes found.")
+            sys.exit(1)
+
+        if not args.generate_actor and actor_image and not os.path.exists(actor_image):
             print(f"ERROR: Actor image not found: {actor_image}")
             sys.exit(1)
 
         # Remove text/captions from actor image unless disabled
         if not args.no_clean_image:
             print("\n=== Cleaning actor image (removing text/captions) ===")
-            actor_image = remove_text_from_image(actor_image, output_dir)
+            actor_image = remove_text_from_image(actor_image, output_dir, cost_tracker=cost_tracker)
 
         if args.mode == "omnihuman":
             generated_clips = generate_omnihuman_video(
                 actor_image, new_audio_path, output_dir,
                 resolution=args.resolution, turbo=args.turbo,
+                cost_tracker=cost_tracker,
             )
         else:
             generated_clips = generate_sadtalker_video(
                 actor_image, new_audio_path, output_dir,
+                cost_tracker=cost_tracker,
             )
     else:
         generated_clips = generate_scene_videos(
-            keyframe_dir, transcript, output_dir, args.prompt
+            keyframe_dir, transcript, output_dir, args.prompt,
+            cost_tracker=cost_tracker,
         )
 
     # Phase 5: Assemble
     assemble_final_video(generated_clips, new_audio_path, output_dir)
+
+    # Save cost tracking
+    run_path, global_path = cost_tracker.save_run(output_dir)
+    print(f"\nCosts saved: {run_path} | {global_path}")
+    print(f"  Est. total: ${cost_tracker._run_total_usd():.4f} USD")
 
 
 if __name__ == "__main__":

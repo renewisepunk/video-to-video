@@ -1,6 +1,9 @@
 # Environment
 .env
 
+# Cost tracking (local usage data)
+costs.json
+
 # Python
 __pycache__/
 *.pyc

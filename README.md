@@ -11,6 +11,7 @@ Takes an existing video, extracts its content, and recreates it with new AI-gene
   - **Scene-based** – Per-scene generation via Luma Dream Machine (no actor image needed)
 - **Automatic text removal** – OCR + inpainting to strip captions/watermarks from actor images
 - **Incremental processing** – Skips phases when outputs already exist
+- **Cost tracking** – Saves API usage and estimated costs locally (ElevenLabs, Fal.ai)
 
 ## Prerequisites
 
@@ -102,15 +103,30 @@ python recreate_video.py Videos/your_video.mp4 --mode scenes --prompt "A futuris
 
 Outputs are written to `<video_name>_v1/`, `<video_name>_v2/`, etc., under the video’s parent directory.
 
+## Cost Tracking
+
+Each run records API usage and estimated costs to:
+
+- **`costs.json`** (project root) – Cumulative log of all runs with totals
+- **`<output_dir>/costs.json`** – Per-run breakdown for that output
+
+Tracked services:
+- **ElevenLabs** – Characters used for TTS (~$0.12 per 1K chars)
+- **Fal.ai** – Per-call estimates for OCR, FLUX inpainting, OmniHuman, SadTalker, Luma Dream Machine
+
+Pricing is configurable in `cost_tracker.py` (`DEFAULT_PRICING`). Actual billing may differ by account.
+
 ## Project Structure
 
 ```
 video-to-video/
 ├── recreate_video.py    # Main pipeline script
+├── cost_tracker.py       # API usage & cost tracking
+├── costs.json            # Cumulative cost log (generated, gitignored)
 ├── requirements.txt
-├── .env                 # API keys (create from template above)
-├── PRD/                 # Product requirements & guides
-└── Videos/              # Source videos and outputs
+├── .env                  # API keys (create from template above)
+├── PRD/                  # Product requirements & guides
+└── Videos/               # Source videos and outputs
 ```
 
 ## References
