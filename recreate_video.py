@@ -24,7 +24,6 @@ from dotenv import load_dotenv
 from moviepy import VideoFileClip, concatenate_videoclips, AudioFileClip
 from scenedetect import detect, AdaptiveDetector, save_images, open_video
 import whisper
-from elevenlabs.client import ElevenLabs
 import fal_client
 
 from cost_tracker import CostTracker
@@ -53,16 +52,21 @@ def _analyze_scene(keyframe_path):
     from google.genai import types
 
     client = genai.Client(api_key=GEMINI_API_KEY)
-    image = Image.open(keyframe_path)
+
+    with open(keyframe_path, "rb") as f:
+        image_bytes = f.read()
+    mime = "image/jpeg" if keyframe_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
 
     response = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=[
-            types.Part.from_image(image),
-            "Describe this video frame for recreating it with a different person. "
-            "Focus on: camera angle, framing (close-up/medium/wide), background "
-            "environment, lighting (natural/studio/warm/cool), clothing style, "
-            "body posture and hand gestures, overall mood. "
+            types.Part.from_bytes(data=image_bytes, mime_type=mime),
+            "Describe this video frame's SETTING ONLY for recreating it with a "
+            "completely different person. Focus on: camera angle, framing "
+            "(close-up/medium/wide), background environment, lighting "
+            "(natural/studio/warm/cool), general clothing style (NOT specific to "
+            "this person), body posture type, overall mood and color palette. "
+            "Do NOT describe the person's face, hair, skin color, or identity. "
             "Ignore any text, captions, or watermarks. "
             "Be specific and concise (3-4 sentences).",
         ],
@@ -71,10 +75,11 @@ def _analyze_scene(keyframe_path):
 
 
 def generate_actor_image(actor_description, keyframe_path, output_dir):
-    """Generate an actor image matching the original video's style.
+    """Generate a unique new actor inspired by the original video's style.
 
     1. Analyze a keyframe to extract scene context (background, lighting, framing)
-    2. Combine with user's actor description to generate a coherent new image
+    2. Combine with user's actor description to generate a NEW unique person
+       that fits naturally in the same setting
     """
     print("\n=== Generating Actor Image (Gemini) ===")
 
@@ -85,23 +90,29 @@ def generate_actor_image(actor_description, keyframe_path, output_dir):
 
     from google import genai
 
-    # Step 1: Analyze the original scene
+    # Step 1: Analyze the original scene (setting only, not the person)
     print("  Analyzing original video scene...")
     scene_description = _analyze_scene(keyframe_path)
     print(f"  Scene: {scene_description}")
 
-    # Step 2: Build a coherent prompt combining scene + new actor
+    # Step 2: Build prompt for a unique new person in a similar setting
     prompt = (
-        f"Generate a realistic photograph of the following person: {actor_description}. "
-        f"Place them in this exact scene and style: {scene_description}. "
-        "The image should look like a real video frame, not AI-generated. "
-        "Portrait orientation. No text, no captions, no watermarks."
+        f"Generate a realistic photograph of a completely NEW and UNIQUE person: "
+        f"{actor_description}. "
+        f"Place them in a setting inspired by (but not identical to) this scene: "
+        f"{scene_description}. "
+        "This must be a DIFFERENT person from the original - unique face, unique "
+        "features, unique look. The setting and vibe should feel similar but not "
+        "be an exact copy. "
+        "The image should look like a natural video frame from a smartphone camera. "
+        "Portrait orientation, upper body visible. "
+        "No text, no captions, no watermarks, no AI artifacts."
     )
     print(f"  Generating new actor image...")
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     response = client.models.generate_content(
-        model="gemini-2.5-flash-image",
+        model="gemini-3-pro-image-preview",
         contents=[prompt],
     )
 
@@ -204,6 +215,7 @@ def recreate_audio(transcript, voice_id, output_dir, cost_tracker=None):
     if not os.path.exists(new_audio_path):
         text = transcript["text"]
         print(f"Generating speech with voice_id={voice_id}...")
+        from elevenlabs.client import ElevenLabs
         from elevenlabs import VoiceSettings
 
         client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
@@ -235,25 +247,166 @@ def recreate_audio(transcript, voice_id, output_dir, cost_tracker=None):
     return new_audio_path
 
 
-def _post_process_audio(audio_path):
-    """Apply light post-processing: high-pass filter + loudness normalization."""
-    try:
+def recreate_audio_qwen(transcript, output_dir, speaker="Ryan", instruct=None):
+    """Generate a new audio track from the transcript using local Qwen3-TTS."""
+    print("\n=== Phase 3: Audio Recreation (Qwen3-TTS, local) ===")
+
+    new_audio_path = os.path.join(output_dir, "new_audio.mp3")
+    if not os.path.exists(new_audio_path):
+        text = transcript["text"]
+        print(f"Generating speech with Qwen3-TTS (speaker={speaker})...")
+
+        import torch
+        import numpy as np
+        from qwen_tts import Qwen3TTSModel
+        import soundfile as sf
+
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        print(f"  Device: {device}")
+
+        model = Qwen3TTSModel.from_pretrained(
+            "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            device_map=device,
+        )
+
+        gen_kwargs = {
+            "text": text,
+            "language": "Auto",
+            "speaker": speaker,
+        }
+        if instruct:
+            gen_kwargs["instruct"] = instruct
+
+        print("  Running inference (this may take a while)...")
+        audio_list, sample_rate = model.generate_custom_voice(**gen_kwargs)
+        audio_array = np.concatenate(audio_list) if len(audio_list) > 1 else audio_list[0]
+
+        # Save as WAV first, then convert to MP3 for pipeline consistency
+        wav_path = os.path.join(output_dir, "new_audio_qwen.wav")
+        sf.write(wav_path, audio_array, sample_rate)
+        print(f"  -> WAV saved: {wav_path}")
+
         from pydub import AudioSegment
-        from pydub.effects import normalize, high_pass_filter
+        AudioSegment.from_wav(wav_path).export(
+            new_audio_path, format="mp3", bitrate="128k"
+        )
+        os.remove(wav_path)
+        print(f"  -> MP3 saved: {new_audio_path}")
 
-        print("  Applying audio post-processing...")
-        audio = AudioSegment.from_mp3(audio_path)
+        # Post-processing for naturalness
+        _post_process_audio(new_audio_path)
+    else:
+        print("New audio already generated, skipping.")
 
-        # Remove sub-80Hz rumble common in TTS output
-        audio = high_pass_filter(audio, cutoff=80)
+    return new_audio_path
 
-        # Normalize loudness (~-16 LUFS broadcast level)
-        audio = normalize(audio, headroom=1.0)
 
-        audio.export(audio_path, format="mp3", bitrate="128k")
-        print("  -> Post-processing applied (high-pass + normalization)")
-    except ImportError:
-        print("  pydub not installed; skipping post-processing.")
+def _post_process_audio(audio_path):
+    """Apply outdoor balcony ambient processing to make TTS sound on-location.
+
+    Simulates recording on a balcony/patio: glass behind, open air in front.
+    Short reverb (glass reflection), airy highs, subtle wind + traffic bed.
+    """
+    try:
+        import numpy as np
+        import soundfile as sf
+        from scipy import signal as sp_signal
+        from pedalboard import (
+            Pedalboard, Reverb, Compressor, HighpassFilter,
+            LowShelfFilter, HighShelfFilter, PeakFilter,
+            NoiseGate, Limiter,
+        )
+
+        print("  Applying outdoor balcony ambient processing...")
+
+        # Convert mp3 to wav for processing
+        from pydub import AudioSegment
+        wav_path = audio_path.replace(".mp3", "_tmp.wav")
+        AudioSegment.from_mp3(audio_path).export(wav_path, format="wav")
+
+        audio, sample_rate = sf.read(wav_path, dtype="float32")
+        if audio.ndim == 1:
+            audio = audio[:, np.newaxis]
+        audio_pb = audio.T
+
+        board = Pedalboard([
+            # Sub-bass cut (no room resonance outdoors) - 12dB/oct
+            HighpassFilter(cutoff_frequency_hz=110),
+            HighpassFilter(cutoff_frequency_hz=110),
+
+            # Remove indoor "boxy" warmth (200-400 Hz)
+            LowShelfFilter(cutoff_frequency_hz=320, gain_db=-2.5, q=0.7),
+
+            # Dip the nasal "honk" zone from indoor recordings
+            PeakFilter(cutoff_frequency_hz=480, gain_db=-1.8, q=1.2),
+
+            # Outdoor "air" presence boost (8kHz+)
+            HighShelfFilter(cutoff_frequency_hz=8000, gain_db=2.8, q=0.7),
+
+            # Upper-mid clarity (3-5kHz speech presence)
+            PeakFilter(cutoff_frequency_hz=3800, gain_db=1.5, q=1.0),
+
+            # Reverb: glass reflection, very short, minimal tail
+            Reverb(room_size=0.12, damping=0.85,
+                   wet_level=0.06, dry_level=1.0, width=0.4),
+
+            # Gentle outdoor-style compression
+            Compressor(threshold_db=-18.0, ratio=2.0,
+                       attack_ms=20.0, release_ms=200.0),
+
+            # Prevent unnatural digital silence between words
+            NoiseGate(threshold_db=-72.0, ratio=1.5,
+                      attack_ms=5.0, release_ms=150.0),
+
+            # Output limiter
+            Limiter(threshold_db=-1.0, release_ms=50.0),
+        ])
+
+        processed = board(audio_pb, sample_rate)
+        n_samples = processed.shape[-1]
+
+        # --- Outdoor ambient noise floor ---
+        rng = np.random.default_rng(seed=42)
+
+        # Wind layer: low-pass filtered noise with gust envelope
+        white = rng.standard_normal(n_samples).astype(np.float32)
+        sos_wind = sp_signal.butter(4, 200.0 / (sample_rate / 2),
+                                    btype='low', output='sos')
+        wind_noise = sp_signal.sosfilt(sos_wind, white)
+        t = np.linspace(0, n_samples / sample_rate, n_samples)
+        gust = 0.5 + 0.5 * np.clip(
+            0.5 * np.sin(2 * np.pi * 0.15 * t)
+            + 0.3 * np.sin(2 * np.pi * 0.07 * t + 0.8)
+            + 0.2 * rng.standard_normal(n_samples), -1, 1
+        )
+        wind_noise *= gust
+        wind_rms = np.sqrt(np.mean(wind_noise ** 2)) + 1e-10
+        wind_noise *= (10 ** (-52.0 / 20.0)) / wind_rms
+
+        # Distant traffic layer: 80-400 Hz bandpass
+        traffic_white = rng.standard_normal(n_samples).astype(np.float32)
+        sos_traffic = sp_signal.butter(
+            4, [80.0 / (sample_rate / 2), 400.0 / (sample_rate / 2)],
+            btype='band', output='sos')
+        traffic_noise = sp_signal.sosfilt(sos_traffic, traffic_white)
+        traffic_rms = np.sqrt(np.mean(traffic_noise ** 2)) + 1e-10
+        traffic_noise *= (10 ** (-62.0 / 20.0)) / traffic_rms
+
+        ambient = (wind_noise + traffic_noise).astype(np.float32)
+        n_channels = processed.shape[0]
+        ambient_2d = np.stack([ambient] * n_channels, axis=0)
+
+        processed = np.clip(processed + ambient_2d, -1.0, 1.0).T
+        sf.write(wav_path, processed, sample_rate)
+
+        # Convert back to mp3
+        AudioSegment.from_wav(wav_path).export(audio_path, format="mp3", bitrate="128k")
+        os.remove(wav_path)
+
+        print("  -> Outdoor balcony processing applied (reverb + EQ + wind + traffic)")
+    except ImportError as e:
+        print(f"  Missing dependency ({e}); skipping audio post-processing.")
+        print("  Install with: pip install pedalboard soundfile scipy pydub")
     except Exception as e:
         print(f"  WARNING: Post-processing failed ({e}); using raw TTS audio.")
 
@@ -621,6 +774,275 @@ def assemble_final_video(video_clip_paths, new_audio_path, output_dir):
 
 
 # ---------------------------------------------------------------------------
+# Phase 6 – Instagram-style Captions (optional)
+# ---------------------------------------------------------------------------
+
+def _find_bold_font():
+    """Auto-detect a bold font on the system."""
+    candidates = [
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _retranscribe_new_audio(new_audio_path, output_dir, whisper_model="base"):
+    """Transcribe the NEW audio to get accurate timestamps for captions."""
+    print("  Transcribing new audio for caption timing...")
+    transcript_path = os.path.join(output_dir, "new_transcript.json")
+    if os.path.exists(transcript_path):
+        with open(transcript_path, "r") as f:
+            return json.load(f)
+
+    model = whisper.load_model(whisper_model)
+    result = model.transcribe(new_audio_path)
+    with open(transcript_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"  -> New transcript saved: {transcript_path}")
+    return result
+
+
+def _retranscribe_new_audio_wordlevel(new_audio_path, output_dir, whisper_model="base"):
+    """Transcribe the NEW audio with word-level timestamps for Remotion captions."""
+    print("  Transcribing new audio with word-level timestamps...")
+    transcript_path = os.path.join(output_dir, "new_transcript_words.json")
+    if os.path.exists(transcript_path):
+        with open(transcript_path, "r") as f:
+            return json.load(f)
+
+    model = whisper.load_model(whisper_model)
+    result = model.transcribe(new_audio_path, word_timestamps=True)
+    with open(transcript_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"  -> Word-level transcript saved: {transcript_path}")
+    return result
+
+
+def add_captions(video_path, transcript, output_dir, font_size=None,
+                 font_path=None, position_y=0.72):
+    """Burn Instagram-style captions onto the video using MoviePy.
+
+    Follows Instagram Reels/TikTok caption best practices:
+    - Font size: ~5% of video height (auto-scaled to resolution)
+    - Max 2 lines, ~28 chars per line
+    - Positioned at 72% from top (safe zone above IG/TikTok UI)
+    - Bold white text with black stroke outline
+    """
+    import textwrap
+    from moviepy import CompositeVideoClip
+    from moviepy.video.VideoClip import TextClip
+
+    print("\n=== Phase 6: Adding Instagram-style Captions ===")
+
+    captioned_path = os.path.join(output_dir, "final_video_captioned.mp4")
+    if os.path.exists(captioned_path):
+        print(f"  Captioned video already exists: {captioned_path}")
+        return captioned_path
+
+    font = font_path or _find_bold_font()
+    if not font:
+        print("  WARNING: No bold font found. Skipping captions.")
+        return video_path
+
+    segments = transcript.get("segments", [])
+    if not segments:
+        print("  WARNING: No transcript segments. Skipping captions.")
+        return video_path
+
+    video = VideoFileClip(video_path)
+    vid_w, vid_h = video.size
+
+    # Auto-scale font size to ~5% of video height if not specified
+    if font_size is None:
+        font_size = max(28, int(vid_h * 0.048))
+    stroke_w = max(2, int(font_size * 0.055))
+
+    y_px = int(vid_h * position_y)
+    # Max chars per line scaled to width (~28 for 1080px, ~20 for 720px)
+    chars_per_line = max(18, int(vid_w / 36))
+
+    print(f"  Resolution: {vid_w}x{vid_h}, font: {font_size}px, "
+          f"stroke: {stroke_w}px, wrap: {chars_per_line} chars/line")
+
+    text_clips = []
+    for seg in segments:
+        text = seg["text"].strip()
+        if not text:
+            continue
+
+        # Wrap to max 2 lines
+        lines = textwrap.wrap(text, width=chars_per_line)
+        if len(lines) > 2:
+            lines = lines[:2]
+        wrapped = "\n".join(lines)
+
+        start = seg["start"]
+        duration = seg["end"] - seg["start"]
+        if duration <= 0:
+            continue
+
+        try:
+            txt = TextClip(
+                font=font,
+                text=wrapped,
+                font_size=font_size,
+                color="white",
+                stroke_color="black",
+                stroke_width=stroke_w,
+                margin=(stroke_w + 4, stroke_w + 4),
+                method="label",
+                text_align="center",
+                horizontal_align="center",
+                vertical_align="center",
+                transparent=True,
+            )
+            txt = (txt
+                   .with_start(start)
+                   .with_duration(duration)
+                   .with_position(("center", y_px)))
+            text_clips.append(txt)
+        except Exception as e:
+            print(f"  WARNING: Skipping segment '{text[:30]}...': {e}")
+            continue
+
+    if not text_clips:
+        print("  No captions generated. Skipping.")
+        video.close()
+        return video_path
+
+    print(f"  Compositing {len(text_clips)} caption segments...")
+    captioned = CompositeVideoClip([video] + text_clips)
+
+    captioned.write_videofile(
+        captioned_path,
+        codec="libx264",
+        audio_codec="aac",
+        logger=None,
+    )
+
+    video.close()
+    captioned.close()
+    for tc in text_clips:
+        tc.close()
+
+    size_mb = os.path.getsize(captioned_path) / (1024 * 1024)
+    print(f"  -> Captioned video saved: {captioned_path} ({size_mb:.1f} MB)")
+    return captioned_path
+
+
+# ---------------------------------------------------------------------------
+# Phase 6b – Remotion Animated Captions (optional)
+# ---------------------------------------------------------------------------
+
+def add_remotion_captions(video_path, new_audio_path, output_dir, whisper_model="base"):
+    """Overlay Instagram/TikTok-style animated captions using Remotion.
+
+    Pipeline:
+      1. Word-level Whisper transcription
+      2. Convert to Remotion Caption[] JSON
+      3. Copy assets to remotion/public/
+      4. npm install (first time only)
+      5. npx remotion render
+      6. Move output back
+    """
+    import shutil
+    import subprocess
+    from convert_captions import whisper_to_remotion_captions
+
+    print("\n=== Phase 6b: Remotion Animated Captions ===")
+
+    captioned_path = os.path.join(output_dir, "final_video_captioned.mp4")
+    if os.path.exists(captioned_path):
+        print(f"  Captioned video already exists: {captioned_path}")
+        return captioned_path
+
+    # Step 1: Word-level transcription
+    word_transcript = _retranscribe_new_audio_wordlevel(
+        new_audio_path, output_dir, whisper_model
+    )
+
+    # Step 2: Convert to Remotion format
+    captions_json_path = os.path.join(output_dir, "remotion_captions.json")
+    captions = whisper_to_remotion_captions(word_transcript, captions_json_path)
+    print(f"  -> {len(captions)} caption words converted")
+
+    # Step 3: Get video metadata
+    video = VideoFileClip(video_path)
+    vid_w, vid_h = video.size
+    vid_fps = video.fps
+    vid_duration = video.duration
+    total_frames = int(vid_duration * vid_fps)
+    video.close()
+    print(f"  Video: {vid_w}x{vid_h} @ {vid_fps}fps, {total_frames} frames")
+
+    # Step 4: Copy assets to remotion/public/
+    remotion_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "remotion")
+    public_dir = os.path.join(remotion_dir, "public")
+    os.makedirs(public_dir, exist_ok=True)
+
+    public_video = os.path.join(public_dir, "video.mp4")
+    public_captions = os.path.join(public_dir, "captions.json")
+    shutil.copy2(video_path, public_video)
+    shutil.copy2(captions_json_path, public_captions)
+    print(f"  -> Copied video + captions to remotion/public/")
+
+    # Step 5: npm install if needed
+    node_modules = os.path.join(remotion_dir, "node_modules")
+    if not os.path.exists(node_modules):
+        print("  Installing Remotion dependencies (first time)...")
+        subprocess.run(
+            ["npm", "install"],
+            cwd=remotion_dir,
+            check=True,
+        )
+        print("  -> npm install complete")
+
+    # Step 6: Render with Remotion
+    render_output = os.path.join(remotion_dir, "out", "CaptionOverlay.mp4")
+    print("  Rendering captioned video with Remotion...")
+    print(f"  (this may take a while for {total_frames} frames)")
+
+    props = json.dumps({})  # no dynamic props needed; composition reads from public/
+
+    render_cmd = [
+        "npx", "remotion", "render",
+        "src/Root.tsx",
+        "CaptionOverlay",
+        render_output,
+        "--width", str(vid_w),
+        "--height", str(vid_h),
+        "--fps", str(int(vid_fps)),
+        "--frames", f"0-{total_frames - 1}",
+        "--props", props,
+    ]
+
+    subprocess.run(
+        render_cmd,
+        cwd=remotion_dir,
+        check=True,
+    )
+
+    # Step 7: Move output
+    shutil.move(render_output, captioned_path)
+    print(f"  -> Cleaning up remotion/public/ assets...")
+
+    # Clean up copied assets from public/
+    for f in [public_video, public_captions]:
+        if os.path.exists(f):
+            os.remove(f)
+
+    size_mb = os.path.getsize(captioned_path) / (1024 * 1024)
+    print(f"  -> Remotion captioned video saved: {captioned_path} ({size_mb:.1f} MB)")
+    return captioned_path
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -655,9 +1077,25 @@ Examples:
              "framing are automatically matched to the original video.",
     )
     parser.add_argument(
+        "--tts",
+        default="elevenlabs",
+        choices=["elevenlabs", "qwen"],
+        help="TTS engine: 'elevenlabs' (cloud API) or 'qwen' (local Qwen3-TTS, free). Default: elevenlabs",
+    )
+    parser.add_argument(
         "--voice-id",
         default=None,
         help="ElevenLabs voice ID (default: from VOICE_ID env var)",
+    )
+    parser.add_argument(
+        "--qwen-speaker",
+        default="Ryan",
+        help="Speaker name for Qwen3-TTS CustomVoice mode (default: Ryan)",
+    )
+    parser.add_argument(
+        "--qwen-instruct",
+        default=None,
+        help="Optional instruction for Qwen3-TTS tone/emotion control",
     )
     parser.add_argument(
         "--whisper-model",
@@ -698,6 +1136,22 @@ Examples:
         "--no-clean-image",
         action="store_true",
         help="Skip automatic text/caption removal from actor image",
+    )
+    parser.add_argument(
+        "--captions",
+        action="store_true",
+        help="Add Instagram-style captions to the final video",
+    )
+    parser.add_argument(
+        "--caption-size",
+        type=int,
+        default=None,
+        help="Font size for captions (default: auto ~5%% of video height)",
+    )
+    parser.add_argument(
+        "--remotion-captions",
+        action="store_true",
+        help="Add animated Instagram/TikTok-style captions using Remotion (requires Node.js)",
     )
     parser.add_argument(
         "--skip-video-gen",
@@ -742,8 +1196,14 @@ def main():
     transcript = transcribe_audio(audio_path, output_dir, args.whisper_model)
 
     # Phase 3: Recreate audio
-    voice_id = args.voice_id or DEFAULT_VOICE_ID
-    new_audio_path = recreate_audio(transcript, voice_id, output_dir, cost_tracker=cost_tracker)
+    if args.tts == "qwen":
+        new_audio_path = recreate_audio_qwen(
+            transcript, output_dir,
+            speaker=args.qwen_speaker, instruct=args.qwen_instruct,
+        )
+    else:
+        voice_id = args.voice_id or DEFAULT_VOICE_ID
+        new_audio_path = recreate_audio(transcript, voice_id, output_dir, cost_tracker=cost_tracker)
 
     if args.skip_video_gen:
         print("\n--skip-video-gen set. Stopping before video generation.")
@@ -801,7 +1261,17 @@ def main():
         )
 
     # Phase 5: Assemble
-    assemble_final_video(generated_clips, new_audio_path, output_dir)
+    final_path = assemble_final_video(generated_clips, new_audio_path, output_dir)
+
+    # Phase 6: Captions (optional)
+    if args.remotion_captions:
+        add_remotion_captions(final_path, new_audio_path, output_dir, args.whisper_model)
+    elif args.captions:
+        new_transcript = _retranscribe_new_audio(
+            new_audio_path, output_dir, args.whisper_model
+        )
+        add_captions(final_path, new_transcript, output_dir,
+                     font_size=args.caption_size)
 
     # Save cost tracking
     run_path, global_path = cost_tracker.save_run(output_dir)

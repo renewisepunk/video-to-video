@@ -21,6 +21,12 @@ Videos/
 *.mp4
 *.mp3
 
+# Remotion
+remotion/node_modules/
+remotion/out/
+remotion/public/video.mp4
+remotion/public/captions.json
+
 # OS
 .DS_Store
 Thumbs.db
